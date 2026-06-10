@@ -1,0 +1,24 @@
+{
+    "author": "andrew129260@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "pebbleball",
+    "pebble": {
+        "displayName": "PebbleBall",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "emery"
+        ],
+        "uuid": "74d7865f-b20e-4296-bc4f-0e85344c0475",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
