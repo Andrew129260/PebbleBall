@@ -9,7 +9,21 @@
         "messageKeys": [],
         "projectType": "native",
         "resources": {
-            "media": []
+            "media": [
+                {
+                    "file": "images/pebbleballappicon25.png",
+                    "menuIcon": true,
+                    "name": "pebbleballappicon25",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pebbleballappicon16.png",
+                    "name": "pebbleballappicon16",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                }
+            ]
         },
         "sdkVersion": "3",
         "targetPlatforms": [
@@ -20,5 +34,5 @@
             "watchface": false
         }
     },
-    "version": "1.0.0"
+    "version": "2.0.0"
 }

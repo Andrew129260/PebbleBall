@@ -5,13 +5,20 @@
 #define PLAYBOX_HEIGHT 200
 #define HUD_OFFSET 28
 #define TICK_RATE_MS 33 
-#define SWIPE_THRESHOLD 8 // Lowered for hyper-responsive touch
+#define SWIPE_THRESHOLD 12 
 #define WALL_GROWTH_SPEED 6
 #define WALL_THICKNESS 4
 #define TOTAL_AREA (PLAYBOX_WIDTH * PLAYBOX_HEIGHT)
-#define WIN_THRESHOLD 70 // Changed to 70% per your suggestion
+#define WIN_THRESHOLD 70 
+
+#define MAX_ROOMS 100
+#define MAX_WALLS 256
 
 #define ENABLE_TOUCH 1
+
+// Keys for persistent memory saving
+#define PERSIST_KEY_LEVEL 1
+#define PERSIST_KEY_LIVES 2
 
 // --- Structures & States ---
 
@@ -64,18 +71,20 @@ static int s_atom_count = 0;
 
 static ActiveWall s_active_wall = { .state = WALL_STATE_NONE };
 
-static Room s_rooms[100];
+static Room s_rooms[MAX_ROOMS];
 static int s_room_count = 0;
 
-static GRect s_captured_rooms[100];
+static GRect s_captured_rooms[MAX_WALLS];
 static int s_captured_room_count = 0;
 
-static GRect s_built_walls[100];
+static GRect s_built_walls[MAX_WALLS];
 static int s_built_wall_count = 0;
 
 static int s_current_level = 1;
 static int s_lives = 3;
 static int s_total_captured_area = 0;
+
+static GPoint s_stars[40];
 
 // Hybrid Button Cursor State
 static GPoint s_cursor_pos = {100, 100};
@@ -87,11 +96,20 @@ static int16_t s_touch_start_x = 0;
 static int16_t s_touch_start_y = 0;
 #endif
 
-// --- Helper Math ---
+// --- Helper Math & Memory Management ---
 
 static bool point_in_rect(int px, int py, GRect r) {
     return (px >= r.origin.x && px <= r.origin.x + r.size.w &&
             py >= r.origin.y && py <= r.origin.y + r.size.h);
+}
+
+// Garbage collection finder for recycled arrays
+static int get_free_room_index() {
+    for (int i = 0; i < s_room_count; i++) {
+        if (!s_rooms[i].active) return i;
+    }
+    if (s_room_count < MAX_ROOMS) return s_room_count++;
+    return -1; 
 }
 
 // --- Game Logic & State Transitions ---
@@ -103,6 +121,11 @@ static void set_background_atoms() {
         s_atoms[i].y = PLAYBOX_HEIGHT / 2;
         s_atoms[i].dx = (i % 2 == 0) ? 4 : -4;
         s_atoms[i].dy = (i % 3 == 0) ? 4 : -4;
+    }
+    
+    // Generate new random stars for splash
+    for (int i = 0; i < 40; i++) {
+        s_stars[i] = GPoint(rand() % PLAYBOX_WIDTH, rand() % PLAYBOX_HEIGHT);
     }
 }
 
@@ -121,6 +144,8 @@ static void init_level(int level) {
         s_atoms[i].dy = (i % 3 == 0) ? speed : -speed;
     }
 
+    for (int i = 0; i < MAX_ROOMS; i++) s_rooms[i].active = false;
+    
     s_rooms[0].active = true;
     s_rooms[0].bounds = GRect(0, 0, PLAYBOX_WIDTH, PLAYBOX_HEIGHT);
     s_room_count = 1;
@@ -132,6 +157,11 @@ static void init_level(int level) {
     
     s_cursor_pos.x = 100;
     s_cursor_pos.y = 100;
+
+    // Generate new random stars for the level
+    for (int i = 0; i < 40; i++) {
+        s_stars[i] = GPoint(rand() % PLAYBOX_WIDTH, rand() % PLAYBOX_HEIGHT);
+    }
 }
 
 static void transition_to_state(GameState new_state) {
@@ -140,11 +170,11 @@ static void transition_to_state(GameState new_state) {
     if (new_state == STATE_SPLASH) {
         set_background_atoms();
     } else if (new_state == STATE_IN_GAME) {
-        init_level(s_current_level); // Uses whatever level is currently set
+        init_level(s_current_level); 
     } else if (new_state == STATE_GAME_OVER) {
         set_background_atoms();
     } else if (new_state == STATE_LEVEL_COMPLETE) {
-        // Keep the current board state visible, just change state
+        // Keeps the board visible, overlays UI
     }
     layer_mark_dirty(s_canvas_layer);
 }
@@ -153,6 +183,8 @@ static void handle_life_lost() {
     vibes_double_pulse(); 
     s_lives--;
     if (s_lives <= 0) {
+        persist_delete(PERSIST_KEY_LEVEL);
+        persist_delete(PERSIST_KEY_LIVES);
         transition_to_state(STATE_GAME_OVER);
     } else {
         init_level(s_current_level);
@@ -174,7 +206,9 @@ static void split_room(int target_room, ActiveWall wall) {
         wall_rect = GRect(wall.origin_x, r.origin.y, WALL_THICKNESS, r.size.h);
     }
 
-    s_built_walls[s_built_wall_count++] = wall_rect;
+    if (s_built_wall_count < MAX_WALLS) {
+        s_built_walls[s_built_wall_count++] = wall_rect;
+    }
     s_total_captured_area += (wall_rect.size.w * wall_rect.size.h);
 
     int atoms1 = 0, atoms2 = 0;
@@ -183,18 +217,33 @@ static void split_room(int target_room, ActiveWall wall) {
         else if (point_in_rect(s_atoms[i].x, s_atoms[i].y, r2)) atoms2++;
     }
 
-    if (atoms1 == 0 && r1.size.w > 0 && r1.size.h > 0) {
-        s_captured_rooms[s_captured_room_count++] = r1;
+    bool r1_active = (atoms1 > 0 && r1.size.w > 0 && r1.size.h > 0);
+    bool r2_active = (atoms2 > 0 && r2.size.w > 0 && r2.size.h > 0);
+
+    // Process captures (Empty Rooms)
+    if (!r1_active && r1.size.w > 0 && r1.size.h > 0) {
+        if (s_captured_room_count < MAX_WALLS) {
+            s_captured_rooms[s_captured_room_count++] = r1;
+        }
         s_total_captured_area += (r1.size.w * r1.size.h);
-    } else if (r1.size.w > 0 && r1.size.h > 0) {
-        s_rooms[s_room_count++] = (Room){.active = true, .bounds = r1};
+    }
+    
+    if (!r2_active && r2.size.w > 0 && r2.size.h > 0) {
+        if (s_captured_room_count < MAX_WALLS) {
+            s_captured_rooms[s_captured_room_count++] = r2;
+        }
+        s_total_captured_area += (r2.size.w * r2.size.h);
     }
 
-    if (atoms2 == 0 && r2.size.w > 0 && r2.size.h > 0) {
-        s_captured_rooms[s_captured_room_count++] = r2;
-        s_total_captured_area += (r2.size.w * r2.size.h);
-    } else if (r2.size.w > 0 && r2.size.h > 0) {
-        s_rooms[s_room_count++] = (Room){.active = true, .bounds = r2};
+    // Slot Recycling (Active Rooms)
+    if (r1_active) {
+        s_rooms[target_room] = (Room){.active = true, .bounds = r1};
+        if (r2_active) {
+            int free_idx = get_free_room_index();
+            if (free_idx != -1) s_rooms[free_idx] = (Room){.active = true, .bounds = r2};
+        }
+    } else if (r2_active) {
+        s_rooms[target_room] = (Room){.active = true, .bounds = r2};
     }
 
     int percent = (s_total_captured_area * 100) / TOTAL_AREA;
@@ -266,12 +315,24 @@ static void update_wall_growth() {
     }
 }
 
-// --- Menu & D-Pad Controls ---
+// --- Menu & Button Controls ---
+
+static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
+    if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) {
+        persist_write_int(PERSIST_KEY_LEVEL, s_current_level);
+        persist_write_int(PERSIST_KEY_LIVES, s_lives);
+        transition_to_state(STATE_SPLASH);
+    } else if (s_current_state == STATE_SPLASH || s_current_state == STATE_GAME_OVER) {
+        window_stack_pop_all(true);
+    }
+}
 
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
     if (s_current_state == STATE_SPLASH || s_current_state == STATE_GAME_OVER) {
-        s_current_level = 1;
-        s_lives = 3;
+        if (s_current_state == STATE_GAME_OVER) {
+            s_current_level = 1;
+            s_lives = 3;
+        }
         transition_to_state(STATE_IN_GAME);
     } else if (s_current_state == STATE_LEVEL_COMPLETE) {
         s_current_level++;
@@ -319,11 +380,11 @@ static void down_long_click_handler(ClickRecognizerRef recognizer, void *context
 }
 
 static void click_config_provider(void *context) {
+    window_single_click_subscribe(BUTTON_ID_BACK, back_click_handler);
     window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
     window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
     window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
     
-    // Hold Up for Vertical, Hold Down for Horizontal
     window_long_click_subscribe(BUTTON_ID_UP, 500, up_long_click_handler, NULL);
     window_long_click_subscribe(BUTTON_ID_DOWN, 500, down_long_click_handler, NULL);
 }
@@ -343,7 +404,6 @@ static void touch_handler(const TouchEvent *event, void *context) {
         s_touch_start_y = pos_y;
         s_is_swiping = true;
         
-        // Sync the D-Pad cursor to where they touched for hybrid play
         if (s_current_state == STATE_IN_GAME) {
             s_cursor_pos.x = pos_x;
             s_cursor_pos.y = pos_y - HUD_OFFSET;
@@ -358,13 +418,15 @@ static void touch_handler(const TouchEvent *event, void *context) {
             int16_t adx = dx < 0 ? -dx : dx;
             int16_t ady = dy < 0 ? -dy : dy;
             
+            // Vector Dominance & Deadzone Logic
             if (adx > SWIPE_THRESHOLD || ady > SWIPE_THRESHOLD) {
-                if (adx > ady) {
+                if (adx > (ady * 3) / 2) {
                     start_building_wall(s_touch_start_x, s_touch_start_y, ORIENTATION_HORIZONTAL);
-                } else {
+                    s_is_swiping = false; 
+                } else if (ady > (adx * 3) / 2) {
                     start_building_wall(s_touch_start_x, s_touch_start_y, ORIENTATION_VERTICAL);
+                    s_is_swiping = false; 
                 }
-                s_is_swiping = false; 
             }
         }
     }
@@ -379,8 +441,10 @@ static void touch_handler(const TouchEvent *event, void *context) {
         
         if (adx < 15 && ady < 15) {
             if (s_current_state == STATE_SPLASH || s_current_state == STATE_GAME_OVER) {
-                s_current_level = 1;
-                s_lives = 3;
+                if (s_current_state == STATE_GAME_OVER) {
+                    s_current_level = 1;
+                    s_lives = 3;
+                }
                 transition_to_state(STATE_IN_GAME);
             } else if (s_current_state == STATE_LEVEL_COMPLETE) {
                 s_current_level++;
@@ -423,15 +487,17 @@ static void update_physics_tick(void *context) {
             return; 
         }
 
-        GRect bounds = GRect(0, (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) ? HUD_OFFSET : 0, PLAYBOX_WIDTH, (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) ? PLAYBOX_HEIGHT : 228);
-        
+        GRect bounds;
         if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) {
+            bounds = GRect(0, 0, PLAYBOX_WIDTH, PLAYBOX_HEIGHT);
             for(int r = 0; r < s_room_count; r++) {
                 if (s_rooms[r].active && point_in_rect(s_atoms[i].x, s_atoms[i].y, s_rooms[r].bounds)) {
                     bounds = s_rooms[r].bounds;
                     break;
                 }
             }
+        } else {
+            bounds = GRect(0, 0, PLAYBOX_WIDTH, 228);
         }
 
         int next_x = s_atoms[i].x + s_atoms[i].dx;
@@ -470,26 +536,61 @@ static void draw_text_with_shadow(GContext *ctx, const char *text, const char *f
 
 static void canvas_update_proc(Layer *layer, GContext *ctx) {
     
-    graphics_context_set_fill_color(ctx, GColorWhite);
+    // Deep Space Background
+    graphics_context_set_fill_color(ctx, GColorOxfordBlue);
     graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
 
-    graphics_context_set_fill_color(ctx, GColorRed);
+    // Procedural Stars
+    if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE || s_current_state == STATE_SPLASH || s_current_state == STATE_GAME_OVER) {
+        graphics_context_set_fill_color(ctx, GColorPictonBlue); 
+        for (int i = 0; i < 40; i++) {
+            int y_offset = (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) ? HUD_OFFSET : 0;
+            graphics_fill_rect(ctx, GRect(s_stars[i].x, s_stars[i].y + y_offset, 1, 1), 0, GCornerNone);
+        }
+    }
+
+    // Procedural 3D Marbles
     for (int i = 0; i < s_atom_count; i++) {
         int y_offset = (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) ? HUD_OFFSET : 0;
-        graphics_fill_circle(ctx, GPoint(s_atoms[i].x, s_atoms[i].y + y_offset), ATOM_RADIUS);
+        int px = s_atoms[i].x;
+        int py = s_atoms[i].y + y_offset;
+
+        // Base Shadow/Outline
+        graphics_context_set_fill_color(ctx, GColorDarkCandyAppleRed);
+        graphics_fill_circle(ctx, GPoint(px, py), ATOM_RADIUS);
+
+        // Mid-tone
+        graphics_context_set_fill_color(ctx, GColorRed);
+        graphics_fill_circle(ctx, GPoint(px - 1, py - 1), ATOM_RADIUS - 1);
+
+        // Bright core
+        graphics_context_set_fill_color(ctx, GColorMelon);
+        graphics_fill_circle(ctx, GPoint(px - 2, py - 2), ATOM_RADIUS - 2);
+
+        // Specular glint
+        graphics_context_set_fill_color(ctx, GColorWhite);
+        graphics_fill_circle(ctx, GPoint(px - 2, py - 2), 1);
     }
 
     if (s_current_state == STATE_SPLASH) {
-        draw_text_with_shadow(ctx, "PEBBLE", FONT_KEY_BITHAM_30_BLACK, GRect(0, 50, 200, 40), GTextAlignmentCenter, GColorCobaltBlue);
-        draw_text_with_shadow(ctx, "BALL", FONT_KEY_BITHAM_30_BLACK, GRect(0, 85, 200, 40), GTextAlignmentCenter, GColorImperialPurple);
+        draw_text_with_shadow(ctx, "PEBBLE", FONT_KEY_BITHAM_30_BLACK, GRect(0, 40, 200, 40), GTextAlignmentCenter, GColorCeleste);
+        draw_text_with_shadow(ctx, "BALL", FONT_KEY_BITHAM_30_BLACK, GRect(0, 75, 200, 40), GTextAlignmentCenter, GColorPictonBlue);
         
         graphics_context_set_fill_color(ctx, GColorDarkGray);
-        graphics_fill_rect(ctx, GRect(42, 162, 116, 36), 8, GCornersAll); 
+        graphics_fill_rect(ctx, GRect(32, 142, 136, 36), 8, GCornersAll); 
         graphics_context_set_fill_color(ctx, GColorLightGray);
-        graphics_fill_rect(ctx, GRect(40, 160, 116, 36), 8, GCornersAll); 
+        graphics_fill_rect(ctx, GRect(30, 140, 136, 36), 8, GCornersAll); 
         
-        graphics_context_set_text_color(ctx, GColorBlack);
-        graphics_draw_text(ctx, "TAP TO PLAY", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), GRect(0, 166, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+        if (s_current_level > 1) {
+            graphics_context_set_text_color(ctx, GColorBlack);
+            graphics_draw_text(ctx, "TAP/SEL TO RESUME", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), GRect(0, 148, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+        } else {
+            graphics_context_set_text_color(ctx, GColorBlack);
+            graphics_draw_text(ctx, "TAP/SEL TO PLAY", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), GRect(0, 148, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+        }
+
+        graphics_context_set_text_color(ctx, GColorWhite);
+        graphics_draw_text(ctx, "PRESS BACK TO EXIT", fonts_get_system_font(FONT_KEY_GOTHIC_14), GRect(0, 205, 200, 20), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
     } else if (s_current_state == STATE_GAME_OVER) {
         graphics_context_set_fill_color(ctx, GColorWhite);
@@ -509,7 +610,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
         graphics_fill_rect(ctx, GRect(42, 182, 116, 36), 8, GCornersAll); 
         graphics_context_set_fill_color(ctx, GColorLightGray);
         graphics_fill_rect(ctx, GRect(40, 180, 116, 36), 8, GCornersAll); 
-        graphics_draw_text(ctx, "TAP TO RETRY", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), GRect(0, 186, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+        graphics_draw_text(ctx, "TAP/SEL TO RETRY", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), GRect(0, 188, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
     } else if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) {
         graphics_context_set_fill_color(ctx, GColorLightGray);
@@ -525,13 +626,25 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
         graphics_context_set_stroke_width(ctx, 1);
         graphics_draw_rect(ctx, GRect(0, HUD_OFFSET, PLAYBOX_WIDTH, PLAYBOX_HEIGHT));
 
-        graphics_context_set_fill_color(ctx, GColorImperialPurple);
+        // Captured Areas (Neon Grid)
+        graphics_context_set_stroke_color(ctx, GColorIndigo);
+        graphics_context_set_stroke_width(ctx, 1);
         for (int i = 0; i < s_captured_room_count; i++) {
             GRect cap = s_captured_rooms[i];
             cap.origin.y += HUD_OFFSET;
+
+            graphics_context_set_fill_color(ctx, GColorDukeBlue);
             graphics_fill_rect(ctx, cap, 0, GCornerNone);
+
+            for (int x = cap.origin.x; x < cap.origin.x + cap.size.w; x += 10) {
+                graphics_draw_line(ctx, GPoint(x, cap.origin.y), GPoint(x, cap.origin.y + cap.size.h));
+            }
+            for (int y = cap.origin.y; y < cap.origin.y + cap.size.h; y += 10) {
+                graphics_draw_line(ctx, GPoint(cap.origin.x, y), GPoint(cap.origin.x + cap.size.w, y));
+            }
         }
 
+        // Built Walls (3D Bevels)
         for (int i = 0; i < s_built_wall_count; i++) {
             GRect wall = s_built_walls[i];
             wall.origin.y += HUD_OFFSET;
@@ -540,8 +653,16 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
             graphics_context_set_fill_color(ctx, GColorDarkGray);
             graphics_fill_rect(ctx, shadow, 0, GCornerNone);
             
-            graphics_context_set_fill_color(ctx, GColorCobaltBlue);
+            graphics_context_set_fill_color(ctx, GColorBlue);
             graphics_fill_rect(ctx, wall, 0, GCornerNone);
+
+            graphics_context_set_fill_color(ctx, GColorCeleste); 
+            graphics_fill_rect(ctx, GRect(wall.origin.x, wall.origin.y, wall.size.w, 1), 0, GCornerNone); 
+            graphics_fill_rect(ctx, GRect(wall.origin.x, wall.origin.y, 1, wall.size.h), 0, GCornerNone); 
+
+            graphics_context_set_fill_color(ctx, GColorOxfordBlue);
+            graphics_fill_rect(ctx, GRect(wall.origin.x, wall.origin.y + wall.size.h - 1, wall.size.w, 1), 0, GCornerNone); 
+            graphics_fill_rect(ctx, GRect(wall.origin.x + wall.size.w - 1, wall.origin.y, 1, wall.size.h), 0, GCornerNone); 
         }
 
         if (s_active_wall.state != WALL_STATE_NONE) {
@@ -583,7 +704,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
             graphics_fill_rect(ctx, GRect(42, 117, 116, 36), 8, GCornersAll); 
             graphics_context_set_fill_color(ctx, GColorLightGray);
             graphics_fill_rect(ctx, GRect(40, 115, 116, 36), 8, GCornersAll); 
-            graphics_draw_text(ctx, "TAP NEXT", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), GRect(0, 121, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+            graphics_draw_text(ctx, "TAP/SEL NEXT", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), GRect(0, 123, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
         }
     }
 }
@@ -597,6 +718,14 @@ static void main_window_load(Window *window) {
     s_canvas_layer = layer_create(bounds);
     layer_set_update_proc(s_canvas_layer, canvas_update_proc);
     layer_add_child(window_layer, s_canvas_layer);
+
+    if (persist_exists(PERSIST_KEY_LEVEL)) {
+        s_current_level = persist_read_int(PERSIST_KEY_LEVEL);
+        s_lives = persist_read_int(PERSIST_KEY_LIVES);
+    } else {
+        s_current_level = 1;
+        s_lives = 3;
+    }
 
     transition_to_state(STATE_SPLASH);
     s_physics_timer = app_timer_register(TICK_RATE_MS, update_physics_tick, NULL);
