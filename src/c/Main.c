@@ -11,8 +11,10 @@
 #define TOTAL_AREA (PLAYBOX_WIDTH * PLAYBOX_HEIGHT)
 #define WIN_THRESHOLD 70 
 
+#define MAX_ATOMS 50
 #define MAX_ROOMS 100
 #define MAX_WALLS 256
+#define STAR_COUNT 40
 
 #define ENABLE_TOUCH 1
 
@@ -66,7 +68,7 @@ static AppTimer *s_physics_timer;
 
 static GameState s_current_state = STATE_SPLASH;
 
-static Atom s_atoms[50];
+static Atom s_atoms[MAX_ATOMS];
 static int s_atom_count = 0;
 
 static ActiveWall s_active_wall = { .state = WALL_STATE_NONE };
@@ -84,7 +86,7 @@ static int s_current_level = 1;
 static int s_lives = 3;
 static int s_total_captured_area = 0;
 
-static GPoint s_stars[40];
+static GPoint s_stars[STAR_COUNT];
 
 // Hybrid Button Cursor State
 static GPoint s_cursor_pos = {100, 100};
@@ -94,13 +96,30 @@ static bool s_cursor_axis_x = true;
 static bool s_is_swiping = false;
 static int16_t s_touch_start_x = 0;
 static int16_t s_touch_start_y = 0;
+static bool s_touch_subscribed = false;
 #endif
 
 // --- Helper Math & Memory Management ---
 
 static bool point_in_rect(int px, int py, GRect r) {
-    return (px >= r.origin.x && px <= r.origin.x + r.size.w &&
-            py >= r.origin.y && py <= r.origin.y + r.size.h);
+    // Pebble rectangles are best treated as left/top inclusive and
+    // right/bottom exclusive. This prevents x == width / y == height
+    // from being accepted as a valid point inside the playfield.
+    return (px >= r.origin.x && px < r.origin.x + r.size.w &&
+            py >= r.origin.y && py < r.origin.y + r.size.h);
+}
+
+static bool wall_origin_fits_room(GRect room, int px, int py, WallOrientation orientation) {
+    const int right = room.origin.x + room.size.w;
+    const int bottom = room.origin.y + room.size.h;
+
+    if (orientation == ORIENTATION_HORIZONTAL) {
+        // Both resulting rooms must retain positive height.
+        return py > room.origin.y && (py + WALL_THICKNESS) < bottom;
+    }
+
+    // Both resulting rooms must retain positive width.
+    return px > room.origin.x && (px + WALL_THICKNESS) < right;
 }
 
 // Garbage collection finder for recycled arrays
@@ -116,15 +135,24 @@ static int get_free_room_index() {
 
 static void set_background_atoms() {
     s_atom_count = 10;
-    for(int i = 0; i < s_atom_count; i++) {
-        s_atoms[i].x = PLAYBOX_WIDTH / 2;
-        s_atoms[i].y = PLAYBOX_HEIGHT / 2;
-        s_atoms[i].dx = (i % 2 == 0) ? 4 : -4;
-        s_atoms[i].dy = (i % 3 == 0) ? 4 : -4;
+
+    const int margin = ATOM_RADIUS + 2;
+    const int usable_w = PLAYBOX_WIDTH - (margin * 2);
+    const int usable_h = PLAYBOX_HEIGHT - (margin * 2);
+    const int offset_x = rand() % usable_w;
+    const int offset_y = rand() % usable_h;
+
+    for (int i = 0; i < s_atom_count; i++) {
+        // Spread the decorative atoms so duplicate velocity pairs do not
+        // permanently overlap and look like a single ball.
+        s_atoms[i].x = margin + ((offset_x + (i * 37)) % usable_w);
+        s_atoms[i].y = margin + ((offset_y + (i * 61)) % usable_h);
+        s_atoms[i].dx = (rand() & 1) ? 4 : -4;
+        s_atoms[i].dy = (rand() & 1) ? 4 : -4;
     }
     
     // Generate new random stars for splash
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < STAR_COUNT; i++) {
         s_stars[i] = GPoint(rand() % PLAYBOX_WIDTH, rand() % PLAYBOX_HEIGHT);
     }
 }
@@ -132,16 +160,24 @@ static void set_background_atoms() {
 static void init_level(int level) {
     s_current_level = level;
     s_atom_count = s_current_level + 1;
-    if (s_atom_count > 50) s_atom_count = 50; 
+    if (s_atom_count > MAX_ATOMS) s_atom_count = MAX_ATOMS; 
 
     int speed = 3 + (s_current_level / 3);
     if (speed > 6) speed = 6; 
 
-    for(int i = 0; i < s_atom_count; i++) {
-        s_atoms[i].x = PLAYBOX_WIDTH / 2;
-        s_atoms[i].y = PLAYBOX_HEIGHT / 2;
-        s_atoms[i].dx = (i % 2 == 0) ? speed : -speed;
-        s_atoms[i].dy = (i % 3 == 0) ? speed : -speed;
+    const int margin = ATOM_RADIUS + 2;
+    const int usable_w = PLAYBOX_WIDTH - (margin * 2);
+    const int usable_h = PLAYBOX_HEIGHT - (margin * 2);
+    const int offset_x = rand() % usable_w;
+    const int offset_y = rand() % usable_h;
+
+    for (int i = 0; i < s_atom_count; i++) {
+        // Unique starting positions stop atoms with matching velocity signs
+        // from remaining perfectly stacked for the entire level.
+        s_atoms[i].x = margin + ((offset_x + (i * 37)) % usable_w);
+        s_atoms[i].y = margin + ((offset_y + (i * 61)) % usable_h);
+        s_atoms[i].dx = (rand() & 1) ? speed : -speed;
+        s_atoms[i].dy = (rand() & 1) ? speed : -speed;
     }
 
     for (int i = 0; i < MAX_ROOMS; i++) s_rooms[i].active = false;
@@ -159,7 +195,7 @@ static void init_level(int level) {
     s_cursor_pos.y = 100;
 
     // Generate new random stars for the level
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < STAR_COUNT; i++) {
         s_stars[i] = GPoint(rand() % PLAYBOX_WIDTH, rand() % PLAYBOX_HEIGHT);
     }
 }
@@ -192,8 +228,11 @@ static void handle_life_lost() {
 }
 
 static void split_room(int target_room, ActiveWall wall) {
+    if (target_room < 0 || target_room >= s_room_count || !s_rooms[target_room].active) {
+        return;
+    }
+
     GRect r = s_rooms[target_room].bounds;
-    s_rooms[target_room].active = false; 
 
     GRect r1, r2, wall_rect;
     if (wall.orientation == ORIENTATION_HORIZONTAL) {
@@ -205,6 +244,17 @@ static void split_room(int target_room, ActiveWall wall) {
         r2 = GRect(wall.origin_x + WALL_THICKNESS, r.origin.y, (r.origin.x + r.size.w) - (wall.origin_x + WALL_THICKNESS), r.size.h);
         wall_rect = GRect(wall.origin_x, r.origin.y, WALL_THICKNESS, r.size.h);
     }
+
+    // Defensive geometry validation. start_building_wall() already rejects
+    // these cases, but keeping split_room() safe prevents corrupt room state
+    // if it is ever called from another path later.
+    if (r1.size.w <= 0 || r1.size.h <= 0 ||
+        r2.size.w <= 0 || r2.size.h <= 0 ||
+        wall_rect.size.w <= 0 || wall_rect.size.h <= 0) {
+        return;
+    }
+
+    s_rooms[target_room].active = false;
 
     if (s_built_wall_count < MAX_WALLS) {
         s_built_walls[s_built_wall_count++] = wall_rect;
@@ -260,6 +310,12 @@ static void start_building_wall(int px, int raw_y, WallOrientation orientation) 
 
     int py = raw_y - HUD_OFFSET;
 
+    // Reject HUD/outside-edge input instead of allowing x == 200 or y == 200
+    // to create zero/negative-sized rooms.
+    if (px < 0 || px >= PLAYBOX_WIDTH || py < 0 || py >= PLAYBOX_HEIGHT) {
+        return;
+    }
+
     int target = -1;
     for (int r = 0; r < s_room_count; r++) {
         if (s_rooms[r].active && point_in_rect(px, py, s_rooms[r].bounds)) {
@@ -268,6 +324,10 @@ static void start_building_wall(int px, int raw_y, WallOrientation orientation) 
         }
     }
     if (target == -1) return; 
+
+    if (!wall_origin_fits_room(s_rooms[target].bounds, px, py, orientation)) {
+        return;
+    }
 
     s_active_wall.state = WALL_STATE_BUILDING;
     s_active_wall.orientation = orientation;
@@ -278,8 +338,15 @@ static void start_building_wall(int px, int raw_y, WallOrientation orientation) 
     s_active_wall.ext_negative = s_active_wall.ext_positive;
 }
 
-static void update_wall_growth() {
-    if (s_active_wall.state != WALL_STATE_BUILDING) return;
+static bool update_wall_growth() {
+    if (s_active_wall.state != WALL_STATE_BUILDING) return false;
+
+    if (s_active_wall.room_index < 0 ||
+        s_active_wall.room_index >= s_room_count ||
+        !s_rooms[s_active_wall.room_index].active) {
+        s_active_wall.state = WALL_STATE_NONE;
+        return false;
+    }
 
     GRect room_bounds = s_rooms[s_active_wall.room_index].bounds;
     bool pos_hit = false;
@@ -309,16 +376,22 @@ static void update_wall_growth() {
         }
     }
 
-    if (pos_hit && neg_hit) {
-        split_room(s_active_wall.room_index, s_active_wall);
-        s_active_wall.state = WALL_STATE_NONE;
-    }
+    // Do NOT split the room here. The physics tick must first check every
+    // atom against the fully-grown wall so the completion frame cannot
+    // become collision-free.
+    return pos_hit && neg_hit;
 }
 
 // --- Menu & Button Controls ---
 
 static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
     if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) {
+        // If the player backs out from the clear screen, resume should start
+        // the NEXT level rather than replaying the one they already beat.
+        if (s_current_state == STATE_LEVEL_COMPLETE) {
+            s_current_level++;
+        }
+
         persist_write_int(PERSIST_KEY_LEVEL, s_current_level);
         persist_write_int(PERSIST_KEY_LIVES, s_lives);
         transition_to_state(STATE_SPLASH);
@@ -359,10 +432,10 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
     if (s_current_state != STATE_IN_GAME) return;
     if (s_cursor_axis_x) {
         s_cursor_pos.x += 10;
-        if (s_cursor_pos.x > PLAYBOX_WIDTH) s_cursor_pos.x = PLAYBOX_WIDTH;
+        if (s_cursor_pos.x >= PLAYBOX_WIDTH) s_cursor_pos.x = PLAYBOX_WIDTH - 1;
     } else {
         s_cursor_pos.y += 10;
-        if (s_cursor_pos.y > PLAYBOX_HEIGHT) s_cursor_pos.y = PLAYBOX_HEIGHT;
+        if (s_cursor_pos.y >= PLAYBOX_HEIGHT) s_cursor_pos.y = PLAYBOX_HEIGHT - 1;
     }
     layer_mark_dirty(s_canvas_layer);
 }
@@ -405,8 +478,20 @@ static void touch_handler(const TouchEvent *event, void *context) {
         s_is_swiping = true;
         
         if (s_current_state == STATE_IN_GAME) {
+            int game_y = pos_y - HUD_OFFSET;
+
+            // Ignore touches in the HUD or outside the logical playfield.
+            // This keeps touch input under the exact same bounds rules as
+            // button input.
+            if (pos_x < 0 || pos_x >= PLAYBOX_WIDTH ||
+                game_y < 0 || game_y >= PLAYBOX_HEIGHT) {
+                s_is_swiping = false;
+                return;
+            }
+
             s_cursor_pos.x = pos_x;
-            s_cursor_pos.y = pos_y - HUD_OFFSET;
+            s_cursor_pos.y = game_y;
+            layer_mark_dirty(s_canvas_layer);
         }
     } 
     else if (event_type == TouchEvent_PositionUpdate) {
@@ -473,24 +558,43 @@ static bool check_active_wall_penalty(Atom *atom) {
 }
 
 static void update_physics_tick(void *context) {
-    
+    (void)context;
+
+    // AppTimer callbacks are one-shot; once this callback starts, the stored
+    // handle is no longer an active timer that should be cancelled.
+    s_physics_timer = NULL;
+
+    bool wall_completed_this_tick = false;
+
     if (s_current_state == STATE_IN_GAME) {
-        update_wall_growth();
+        wall_completed_this_tick = update_wall_growth();
+
+        // Collision must be checked AFTER growth but BEFORE a completed wall
+        // is committed to the room geometry. This closes the one-tick
+        // completion loophole.
+        for (int i = 0; i < s_atom_count; i++) {
+            if (check_active_wall_penalty(&s_atoms[i])) {
+                handle_life_lost();
+                if (s_current_state == STATE_IN_GAME) {
+                    layer_mark_dirty(s_canvas_layer);
+                }
+                s_physics_timer = app_timer_register(TICK_RATE_MS, update_physics_tick, NULL);
+                return;
+            }
+        }
+
+        if (wall_completed_this_tick && s_active_wall.state == WALL_STATE_BUILDING) {
+            ActiveWall completed_wall = s_active_wall;
+            split_room(completed_wall.room_index, completed_wall);
+            s_active_wall.state = WALL_STATE_NONE;
+        }
     }
 
     for (int i = 0; i < s_atom_count; i++) {
-        
-        if (s_current_state == STATE_IN_GAME && check_active_wall_penalty(&s_atoms[i])) {
-            handle_life_lost();
-            if (s_current_state == STATE_IN_GAME) layer_mark_dirty(s_canvas_layer);
-            s_physics_timer = app_timer_register(TICK_RATE_MS, update_physics_tick, NULL);
-            return; 
-        }
-
         GRect bounds;
         if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) {
             bounds = GRect(0, 0, PLAYBOX_WIDTH, PLAYBOX_HEIGHT);
-            for(int r = 0; r < s_room_count; r++) {
+            for (int r = 0; r < s_room_count; r++) {
                 if (s_rooms[r].active && point_in_rect(s_atoms[i].x, s_atoms[i].y, s_rooms[r].bounds)) {
                     bounds = s_rooms[r].bounds;
                     break;
@@ -503,11 +607,13 @@ static void update_physics_tick(void *context) {
         int next_x = s_atoms[i].x + s_atoms[i].dx;
         int next_y = s_atoms[i].y + s_atoms[i].dy;
         
-        if (next_x - ATOM_RADIUS <= bounds.origin.x || next_x + ATOM_RADIUS >= bounds.origin.x + bounds.size.w) {
+        if (next_x - ATOM_RADIUS <= bounds.origin.x ||
+            next_x + ATOM_RADIUS >= bounds.origin.x + bounds.size.w) {
             s_atoms[i].dx = -s_atoms[i].dx;
             next_x = s_atoms[i].x + s_atoms[i].dx;
         }
-        if (next_y - ATOM_RADIUS <= bounds.origin.y || next_y + ATOM_RADIUS >= bounds.origin.y + bounds.size.h) {
+        if (next_y - ATOM_RADIUS <= bounds.origin.y ||
+            next_y + ATOM_RADIUS >= bounds.origin.y + bounds.size.h) {
             s_atoms[i].dy = -s_atoms[i].dy;
             next_y = s_atoms[i].y + s_atoms[i].dy;
         }
@@ -543,7 +649,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     // Procedural Stars
     if (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE || s_current_state == STATE_SPLASH || s_current_state == STATE_GAME_OVER) {
         graphics_context_set_fill_color(ctx, GColorPictonBlue); 
-        for (int i = 0; i < 40; i++) {
+        for (int i = 0; i < STAR_COUNT; i++) {
             int y_offset = (s_current_state == STATE_IN_GAME || s_current_state == STATE_LEVEL_COMPLETE) ? HUD_OFFSET : 0;
             graphics_fill_rect(ctx, GRect(s_stars[i].x, s_stars[i].y + y_offset, 1, 1), 0, GCornerNone);
         }
@@ -704,6 +810,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
             graphics_fill_rect(ctx, GRect(42, 117, 116, 36), 8, GCornersAll); 
             graphics_context_set_fill_color(ctx, GColorLightGray);
             graphics_fill_rect(ctx, GRect(40, 115, 116, 36), 8, GCornersAll); 
+            graphics_context_set_text_color(ctx, GColorBlack);
             graphics_draw_text(ctx, "TAP/SEL NEXT", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), GRect(0, 123, 200, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
         }
     }
@@ -719,10 +826,24 @@ static void main_window_load(Window *window) {
     layer_set_update_proc(s_canvas_layer, canvas_update_proc);
     layer_add_child(window_layer, s_canvas_layer);
 
-    if (persist_exists(PERSIST_KEY_LEVEL)) {
-        s_current_level = persist_read_int(PERSIST_KEY_LEVEL);
-        s_lives = persist_read_int(PERSIST_KEY_LIVES);
+    if (persist_exists(PERSIST_KEY_LEVEL) && persist_exists(PERSIST_KEY_LIVES)) {
+        int saved_level = persist_read_int(PERSIST_KEY_LEVEL);
+        int saved_lives = persist_read_int(PERSIST_KEY_LIVES);
+
+        if (saved_level >= 1 && saved_lives >= 1 && saved_lives <= 3) {
+            s_current_level = saved_level;
+            s_lives = saved_lives;
+        } else {
+            persist_delete(PERSIST_KEY_LEVEL);
+            persist_delete(PERSIST_KEY_LIVES);
+            s_current_level = 1;
+            s_lives = 3;
+        }
     } else {
+        // If only one key exists, discard the incomplete save rather than
+        // mixing a real value with persist_read_int()'s fallback value.
+        persist_delete(PERSIST_KEY_LEVEL);
+        persist_delete(PERSIST_KEY_LIVES);
         s_current_level = 1;
         s_lives = 3;
     }
@@ -733,20 +854,34 @@ static void main_window_load(Window *window) {
 #if ENABLE_TOUCH && defined(PBL_TOUCH)
     if (touch_service_is_enabled()) {
         touch_service_subscribe(touch_handler, NULL);
+        s_touch_subscribed = true;
     }
 #endif
 }
 
 static void main_window_unload(Window *window) {
-    layer_destroy(s_canvas_layer);
-    if (s_physics_timer) app_timer_cancel(s_physics_timer);
+    if (s_physics_timer) {
+        app_timer_cancel(s_physics_timer);
+        s_physics_timer = NULL;
+    }
     
 #if ENABLE_TOUCH && defined(PBL_TOUCH)
-    touch_service_unsubscribe();
+    if (s_touch_subscribed) {
+        touch_service_unsubscribe();
+        s_touch_subscribed = false;
+    }
 #endif
+
+    if (s_canvas_layer) {
+        layer_destroy(s_canvas_layer);
+        s_canvas_layer = NULL;
+    }
 }
 
 static void init() {
+    // Pebble provides the standard C rand()/srand()/time() APIs.
+    srand((unsigned)time(NULL));
+
     s_main_window = window_create();
     window_set_click_config_provider(s_main_window, click_config_provider);
     window_set_window_handlers(s_main_window, (WindowHandlers) {
@@ -757,7 +892,10 @@ static void init() {
 }
 
 static void deinit() {
-    window_destroy(s_main_window);
+    if (s_main_window) {
+        window_destroy(s_main_window);
+        s_main_window = NULL;
+    }
 }
 
 int main(void) {
